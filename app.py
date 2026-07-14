@@ -12,13 +12,72 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 
-DB_PATH = "signature_db.csv"
+SIGNATURE_DB = "signature_db.csv"
+FLOW_DB = "flow_db.csv"
+AUDIT_DB = "audit_log.csv"
 FEATURE_COLS = ["dst_port","byte_count","tcp_syn","tcp_ack","tcp_rst","tcp_psh","tcp_urg"]
 BASE_PRIOR = 0.65
 RETRAIN_EVERY = 10
 
+def init_databases():
+    if not os.path.exists(SIGNATURE_DB):
+        pd.DataFrame(
+            columns=FEATURE_COLS +
+            [
+                "attack_type",
+                "label",
+                "confirmed_at",
+                "source"
+            ]
+        ).to_csv(SIGNATURE_DB,index=False)
+    if not os.path.exists(FLOW_DB):
+        pd.DataFrame(
+            columns=[
+                "timestamp",
+                "src_ip",
+                "protocol",
+                "dst_port",
+                "byte_count",
+                "tcp_syn",
+                "tcp_ack",
+                "tcp_rst",
+                "prediction",
+                "posterior",
+                "decision"
+            ]
+        ).to_csv(FLOW_DB,index=False)
+    if not os.path.exists(AUDIT_DB):
+        pd.DataFrame(
+            columns=[
+                "timestamp",
+                "action",
+                "object",
+                "reason",
+                "details"
+            ]
+        ).to_csv(AUDIT_DB,index=False)
+def write_audit(action, obj, reason, details):
+    audit=pd.read_csv(AUDIT_DB)
+    entry={
+        "timestamp":
+            datetime.now().isoformat(timespec="seconds"),
+        "action":action,
+        "object":obj,
+        "reason":reason,
+        "details":details
+    }
+    audit=pd.concat(
+        [
+            audit,
+            pd.DataFrame([entry])
+        ],
+        ignore_index=True
+    )
+    audit.to_csv(
+        AUDIT_DB,
+        index=False
+    )
 st.set_page_config(page_title="Bayesian Agentic IDS", page_icon="shield", layout="wide")
-
 st.markdown("""
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
@@ -60,16 +119,84 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-def init_db():
-    if os.path.exists(DB_PATH): return pd.read_csv(DB_PATH)
-    cols = FEATURE_COLS + ["attack_type","label","confirmed_at","source"]
-    db = pd.DataFrame(columns=cols); db.to_csv(DB_PATH, index=False); return db
-
+def load_signature_db():
+    init_databases()
+    return pd.read_csv(SIGNATURE_DB)
 def confirm_signature(flow, at, lbl, src="analyst"):
-    db = init_db(); row = {f: flow.get(f,0) for f in FEATURE_COLS}
-    row.update({"attack_type":at,"label":lbl,"confirmed_at":datetime.now().isoformat(timespec="seconds"),"source":src})
-    db = pd.concat([db, pd.DataFrame([row])], ignore_index=True); db.to_csv(DB_PATH, index=False); return db
-
+    db = pd.read_csv(SIGNATURE_DB)
+    row = {
+        f: flow.get(f,0)
+        for f in FEATURE_COLS
+    }
+    row.update({
+        "attack_type": at,
+        "label": lbl,
+        "confirmed_at": datetime.now().isoformat(timespec="seconds"),
+        "source": src
+    })
+    db = pd.concat(
+        [
+            db,
+            pd.DataFrame([row])
+        ],
+        ignore_index=True
+    )
+    db.to_csv(
+        SIGNATURE_DB,
+        index=False
+    )
+    write_audit(
+        "INSERT",
+        "Signature",
+        f"Analyst confirmed {at}",
+        f"Added signature from {src}. Destination port {row['dst_port']}."
+    )
+    return db
+def save_flow_results(df, results):
+    flows = pd.read_csv(FLOW_DB)
+    rows = []
+    for (_,flow),result in zip(df.iterrows(),results):
+        rows.append({
+            "timestamp":
+                datetime.now().isoformat(timespec="seconds"),
+            "src_ip":
+                flow.get("src_ip","unknown"),
+            "protocol":
+                result["proto"],
+            "dst_port":
+                result["dport"],
+            "byte_count":
+                result["psize"],
+            "tcp_syn":
+                result["syn"],
+            "tcp_ack":
+                result["ack"],
+            "tcp_rst":
+                result["rst"],
+            "prediction":
+                result["attack"],
+            "posterior":
+                result["post"],
+            "decision":
+                result["action"]
+        })
+    flows = pd.concat(
+        [
+            flows,
+            pd.DataFrame(rows)
+        ],
+        ignore_index=True
+    )
+    flows.to_csv(
+        FLOW_DB,
+        index=False
+    )
+    write_audit(
+        "INSERT",
+        "Flows",
+        "CSV batch uploaded",
+        f"{len(rows)} network flows added to database."
+    )
 def update_prior(db, base=BASE_PRIOR):
     if len(db)==0: return base
     emp = db["label"].astype(float).mean(); n=len(db); w=min(0.8,n/(n+20))
@@ -130,7 +257,11 @@ def sample_flows():
 
 for k,v in [("db",None),("prior",None),("retrains",0),("last_acc",None)]:
     if k not in st.session_state: st.session_state[k]=v
-if st.session_state.db is None: st.session_state.db=init_db()
+if st.session_state.db is None:
+
+    init_databases()
+
+    st.session_state.db=load_signature_db()
 if st.session_state.prior is None: st.session_state.prior=update_prior(st.session_state.db)
 
 def pill(action):
@@ -181,6 +312,7 @@ with tab1:
         else:
             df.columns=[c.lower() for c in df.columns]; st.session_state.batch_df=df
             results=[analyze_flow(r,st.session_state.prior) for _,r in df.iterrows()]
+          save_flow_results(df,results)
             counts={"BLOCK":0,"VERIFY":0,"ALLOW":0}
             for r in results: counts[r["action"]]+=1
             cols=st.columns(4)
@@ -254,7 +386,27 @@ with tab3:
     if len(st.session_state.db)>0:
         st.write(""); st.markdown("**Signature database**")
         st.dataframe(st.session_state.db[["dst_port","attack_type","label","source","confirmed_at"]],use_container_width=True,height=240,hide_index=True)
+      st.write("")
+st.markdown("### Database Audit History")
+
+audit=pd.read_csv(AUDIT_DB)
+
+st.dataframe(
+    audit.sort_values(
+        "timestamp",
+        ascending=False
+    ),
+    use_container_width=True,
+    height=300
+)
         if st.button("Reset database"):
-            if os.path.exists(DB_PATH): os.remove(DB_PATH)
+           if os.path.exists(SIGNATURE_DB):
+    os.remove(SIGNATURE_DB)
+
+if os.path.exists(FLOW_DB):
+    os.remove(FLOW_DB)
+
+if os.path.exists(AUDIT_DB):
+    os.remove(AUDIT_DB)
             st.session_state.db=init_db(); st.session_state.prior=update_prior(st.session_state.db); st.session_state.retrains=0
             st.rerun()
